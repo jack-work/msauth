@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -56,7 +57,9 @@ func (f *fakeProxy) env(goos string) wslEnvironment {
 			return "/bin/" + name, nil
 		},
 		run: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if name == "wslinfo" {
+			// Matched on the base name: production now resolves wslinfo to an
+			// absolute path, so this arrives as "/bin/wslinfo".
+			if filepath.Base(name) == "wslinfo" {
 				return []byte(f.proxyPath + "\n"), nil
 			}
 			var method, body string
@@ -261,6 +264,73 @@ func TestMissingWslinfoIsItsOwnCodeAndNamesPATH(t *testing.T) {
 	}
 	if !strings.Contains(authErr.Message, "PATH") {
 		t.Errorf("the message must name PATH, got %q", authErr.Message)
+	}
+	// The remedy differs depending on whether a fallback location was even
+	// looked at, so the message has to say it tried.
+	for _, candidate := range wslInfoFallbacks {
+		if !strings.Contains(authErr.Message, candidate) {
+			t.Errorf("the message must name the fallback %q it tried, got %q", candidate, authErr.Message)
+		}
+	}
+}
+
+// The regression this whole fallback exists for: a systemd user unit has no
+// /bin on PATH, so lookPath fails while /bin/wslinfo is sitting right there.
+// Before the fallback, every such service reported a network problem.
+func TestWslinfoIsFoundAtItsAbsolutePathWhenPATHLacksIt(t *testing.T) {
+	f := &fakeProxy{
+		proxyPath: "/p.exe",
+		noWslinfo: true, // PATH cannot see it, exactly as under systemd
+		replies: map[string]string{
+			"getAccounts": accountsJSON(accountJSON("u@example.com", testTenant)),
+			"acquireTokenSilently": tokenJSON(
+				"t", time.Now().Add(time.Hour).UnixMilli()),
+		},
+	}
+	env := f.env("linux")
+	// The filesystem still has it, at the first fallback location.
+	env.statExecutable = func(path string) error {
+		if path == wslInfoFallbacks[0] {
+			return nil
+		}
+		return errors.New("no such file")
+	}
+
+	resolved, authErr := env.resolveWSLInfo()
+	if authErr != nil {
+		t.Fatalf("resolving should have fallen back, got %v", authErr)
+	}
+	if resolved != wslInfoFallbacks[0] {
+		t.Errorf("resolved = %q, want %q", resolved, wslInfoFallbacks[0])
+	}
+
+	// And the proxy path is then obtainable, which is the part that was broken.
+	proxy, authErr := env.msalProxyPath(context.Background())
+	if authErr != nil {
+		t.Fatalf("msalProxyPath: %v", authErr)
+	}
+	if proxy != "/p.exe" {
+		t.Errorf("proxy = %q, want %q", proxy, "/p.exe")
+	}
+}
+
+// PATH wins when it works: an operator who placed wslinfo deliberately is not
+// second-guessed by a hardcoded list.
+func TestPATHIsPreferredOverTheFallback(t *testing.T) {
+	f := &fakeProxy{proxyPath: "/p.exe"}
+	env := f.env("linux")
+	env.lookPath = func(string) (string, error) { return "/opt/custom/wslinfo", nil }
+	env.statExecutable = func(string) error {
+		t.Error("the fallback was consulted even though PATH resolved")
+		return nil
+	}
+
+	resolved, authErr := env.resolveWSLInfo()
+	if authErr != nil {
+		t.Fatalf("resolveWSLInfo: %v", authErr)
+	}
+	if resolved != "/opt/custom/wslinfo" {
+		t.Errorf("resolved = %q, want the PATH answer", resolved)
 	}
 }
 

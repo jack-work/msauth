@@ -35,10 +35,13 @@ const (
 	// distinguishable without parsing prose.
 	//
 	// wsl_proxy_unavailable means the bridge to the Windows broker could not be
-	// located at all -- overwhelmingly a PATH fault, because wslinfo lives in
-	// /bin and /bin is absent from the PATH of D-Bus-activated and
-	// systemd-managed processes. That one masquerades as a network failure and
-	// cost an afternoon before it was named, which is why it gets its own code.
+	// located at all. Historically this was overwhelmingly a PATH fault,
+	// because wslinfo lives in /bin and /bin is absent from the PATH of
+	// D-Bus-activated and systemd-managed processes; that one masqueraded as a
+	// network failure and cost an afternoon before it was named, which is why
+	// it gets its own code. The PATH fault no longer reaches here -- resolution
+	// falls back to wslInfoFallbacks -- so this code now means wslinfo is
+	// genuinely absent, or answered and gave nothing usable.
 	//
 	// wsl_broker_failed means the bridge worked and the broker declined: no
 	// account for the tenant, a refused request, or an unusable response.

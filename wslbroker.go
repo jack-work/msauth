@@ -110,15 +110,42 @@ type wslEnvironment struct {
 	readFile func(string) ([]byte, error)
 	// lookPath resolves wslinfo.
 	lookPath func(string) (string, error)
+	// statExecutable reports nil when an absolute path names an executable
+	// file. The seam for the PATH-independent fallback below, so it can be
+	// exercised without a WSL filesystem.
+	statExecutable func(string) error
 	// run executes a command and returns its stdout.
 	run func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
+
+// wslInfoFallbacks are the absolute locations of the interop shim, tried in
+// order when PATH does not carry it.
+//
+// Hardcoding these is deliberate and is NOT the same judgement as refusing to
+// hardcode the MSAL proxy path below. The proxy moves with the Windows WSL
+// install and is therefore a claim about someone's filesystem; wslinfo is a
+// symlink to /init that WSL itself installs at a fixed location in every
+// distro. Naming it is describing WSL, not guessing about a machine.
+var wslInfoFallbacks = []string{"/bin/wslinfo", "/usr/bin/wslinfo"}
 
 func defaultWSLEnvironment() wslEnvironment {
 	return wslEnvironment{
 		goos:     runtime.GOOS,
 		readFile: os.ReadFile,
 		lookPath: exec.LookPath,
+		statExecutable: func(path string) error {
+			info, err := os.Stat(path)
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return fmt.Errorf("%s is a directory", path)
+			}
+			if info.Mode()&0o111 == 0 {
+				return fmt.Errorf("%s is not executable", path)
+			}
+			return nil
+		},
 		run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, name, args...)
 			// Stdout only. The proxy writes diagnostics to stderr and its JSON
@@ -149,6 +176,40 @@ func (e wslEnvironment) runningUnderWSL() bool {
 	return strings.Contains(lowered, "microsoft") || strings.Contains(lowered, "wsl")
 }
 
+// resolveWSLInfo locates the interop shim that answers --msal-proxy-path.
+//
+// PATH first, because when PATH is right it is right, and an operator who has
+// put wslinfo somewhere deliberate should win. Then the fixed locations WSL
+// installs it at.
+//
+// THE FAILURE THIS GUARDS IS NOT HYPOTHETICAL. wslinfo is /bin/wslinfo -> /init,
+// the interop shim, and /bin is absent from the PATH of a D-Bus-activated or
+// systemd-managed process even though a login shell has it. Before the fallback
+// existed, every systemd user unit on this box -- tomb's own ingestion daemon
+// among them -- failed authentication with what looked like a network problem,
+// while the same command run by hand in a shell worked. A dependency on PATH is
+// a dependency on who started you.
+func (e wslEnvironment) resolveWSLInfo() (string, *AuthError) {
+	if resolved, err := e.lookPath("wslinfo"); err == nil {
+		return resolved, nil
+	}
+	stat := e.statExecutable
+	if stat == nil {
+		stat = func(string) error { return errors.New("no stat seam configured") }
+	}
+	for _, candidate := range wslInfoFallbacks {
+		if err := stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", &AuthError{
+		Code: CodeWSLProxyUnavailable,
+		Message: "wslinfo is not on PATH and is not at " + strings.Join(wslInfoFallbacks, " or ") +
+			", so the Windows MSAL proxy cannot be located; note that /bin is missing from the " +
+			"PATH of D-Bus-activated and systemd-managed processes even when a login shell has it",
+	}
+}
+
 // msalProxyPath asks WSL where the host-side MSAL proxy lives.
 //
 // It is always asked rather than hardcoded. The answer observed on one machine
@@ -156,26 +217,16 @@ func (e wslEnvironment) runningUnderWSL() bool {
 // installation detail of the Windows WSL package: it moves with the install
 // location, and a committed path would be both wrong elsewhere and a claim
 // about someone's filesystem layout.
-//
-// THE FAILURE THIS GUARDS IS NOT HYPOTHETICAL. wslinfo is /bin/wslinfo -> /init,
-// the interop shim, and /bin is absent from the PATH of a D-Bus-activated or
-// systemd-managed process even though a login shell has it. A service that
-// cannot see wslinfo gets an empty answer and reports a network problem. So a
-// missing wslinfo is reported as its own code, naming PATH.
 func (e wslEnvironment) msalProxyPath(ctx context.Context) (string, *AuthError) {
-	if _, err := e.lookPath("wslinfo"); err != nil {
-		return "", &AuthError{
-			Code: CodeWSLProxyUnavailable,
-			Message: "wslinfo is not on PATH, so the Windows MSAL proxy cannot be located; " +
-				"note that /bin is missing from the PATH of D-Bus-activated and systemd-managed " +
-				"processes even when a login shell has it",
-		}
+	wslinfo, authErr := e.resolveWSLInfo()
+	if authErr != nil {
+		return "", authErr
 	}
-	out, err := e.run(ctx, "wslinfo", "--msal-proxy-path")
+	out, err := e.run(ctx, wslinfo, "--msal-proxy-path")
 	if err != nil {
 		return "", &AuthError{
 			Code:    CodeWSLProxyUnavailable,
-			Message: fmt.Sprintf("wslinfo --msal-proxy-path failed: %v", sanitizeDiagnostic(err.Error())),
+			Message: fmt.Sprintf("%s --msal-proxy-path failed: %v", wslinfo, sanitizeDiagnostic(err.Error())),
 		}
 	}
 	// The value is a path that legitimately contains spaces ("Program Files"),

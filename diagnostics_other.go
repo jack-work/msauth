@@ -27,9 +27,10 @@ func diagnoseBroker(ctx context.Context) BrokerDiagnostics {
 	diagnostics := BrokerDiagnostics{Supported: true, SelectedHost: "wsl-broker"}
 
 	// Resolving the proxy is the whole health question here, and it is cheap:
-	// no token is requested, no account is touched, nothing is signed in. The
-	// overwhelmingly common fault is that wslinfo is not on PATH, and this is
-	// where an operator should find that out.
+	// no token is requested, no account is touched, nothing is signed in.
+	// Resolution tries PATH and then the fixed wslinfo locations, so reaching
+	// an error here means the interop shim is genuinely missing rather than
+	// merely unreachable from this process's PATH.
 	proxy, authErr := env.msalProxyPath(ctx)
 	if authErr != nil {
 		diagnostics.Error = authErr
