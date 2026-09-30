@@ -78,8 +78,11 @@ func ReadFloor(clientDir string) (string, error) {
 			continue
 		}
 		revision, _, _ := strings.Cut(line, " ")
+		if plausibleVersion(revision) {
+			return revision, nil
+		}
 		if !plausibleRevision(revision) {
-			return "", fmt.Errorf("%s: %q is not a foundation revision; the file holds one git revision and optional # comments", path, revision)
+			return "", fmt.Errorf("%s: %q is neither a foundation revision nor a semantic version; the file holds one git revision or one vX.Y.Z version, and optional # comments", path, revision)
 		}
 		return strings.ToLower(revision), nil
 	}
@@ -94,8 +97,14 @@ func (g Gate) Audit() (AuditReport, error) {
 	if g.Floor == "" {
 		return AuditReport{}, errors.New("this gate declares no floor")
 	}
+	// The floor's shape selects the comparison. A version floor is arithmetic
+	// and needs no worktree beside the client, which is the ordinary case once
+	// a client consumes this module normally instead of by filesystem replace.
 	var order Ordering
-	if g.FoundationDir != "" {
+	switch {
+	case plausibleVersion(g.Floor):
+		order = SemverOrdering()
+	case g.FoundationDir != "":
 		order = GitAncestry(g.FoundationDir)
 	}
 	return AuditArtifactsAtLeast(g.Artifacts, g.Floor, order), nil
